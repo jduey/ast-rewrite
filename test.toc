@@ -1,0 +1,295 @@
+
+(main [_]
+      (let [p (fr/evaluate (grmr/read-form) parser/recursive-descent)
+            flat-map-ast (first ((compile-source p) {:text "(fn [ev f]
+                                                              (fn [s]
+                                                                 (let [v-ss (ev s)
+                                                                       v (nth v-ss 0)
+                                                                       ss (nth v-ss 1)]
+                                                                   ((f v) ss))))"}))
+            wrap-ast (first ((compile-source p) {:text "(fn [_ v]
+                                                           (fn [s]
+                                                              (list v s)))"}))
+            cond-ast (first ((compile-source p) {:text "(cond
+                                                           true (inc x)
+                                                           :bogus (dec x)
+                                                           0)"}))
+            ast (first ((compile-source p) {:text "(for [x (get-val :x)
+                                                         y (set-val :x x)]
+                                                     y)"}))
+            ;; new-ast (first ((rewrite ast inline-wrap) {:flat-map-ast flat-map-ast
+            ;;                                            :wrap-ast wrap-ast}))
+            ;; new-ast (first ((rewrite new-ast inline-flat-map) {:flat-map-ast flat-map-ast
+            ;;                                                    :wrap-ast wrap-ast}))
+            ;; new-ast (first ((rewrite new-ast convert-fn-to-let) {}))
+
+            ;; new-ast (first ((for [ast (rewrite ast inline-wrap)
+            ;;                       ast (comp (rewrite ast inline-flat-map)
+            ;;                                 (sm/state-maybe ast))]
+            ;;                   ast) {:flat-map-ast flat-map-ast
+            ;;                         :wrap-ast wrap-ast}))
+            ]
+        ;; (println :ast ast)
+        ;; (println :concrete (first new-ast))
+        ;; (println)
+        ;; (println :result1 (fr/evaluate ast pprint))
+        ;; (println cond-ast)
+        (println (fr/evaluate cond-ast pprint))
+        ))
+
+(defn emit-callsite [ast]
+  (for [target (fr/evaluate (.callee ast) emit-c)
+        args (eval-args (.args (.params ast)))
+        result (comp (call-proto-impl (.callee ast) args)
+                     (call-invoke target args)
+                     (call-static-fixed target args)
+                     (call-static-variadic target args)
+                     (call-recursive target args)
+                     (call-dyn-fn-value target args)
+                     (call-dyn-unknown-type target args)
+                     (call-dyn-known-type target args)
+                     (sm/new-sm (fn [s]
+                                  (print-err (str "could not emit callsite for '"
+                                                  (first (fr/evaluate (.callee ast) string-list))
+                                                  "'"))
+                                  (print-err :target (.c-val target))
+                                  (abort))))]
+    result))
+
+(defprotocol Rename-new-sm
+  (rename-new-sm [ast]
+    (rwr/apply-rewrite ast rename-new-sm)))
+
+(defprotocol InlineFunction
+  (inline-fn [ast]
+    (rwr/apply-rewrite ast inline-fn)))
+
+(defprotocol MergeLets
+  (merge-lets [ast]
+    (rwr/apply-rewrite ast merge-lets)))
+
+(defprotocol CallingLet
+  (calling-let [ast]
+    (rwr/apply-rewrite ast calling-let)))
+
+(extend-type ast/let-ast
+  MergeLets
+  (merge-lets [ast]
+    ;; TODO: currently assumes .body has one element
+    (cond
+     (not (instance? ast/let-ast (.v (first (.args (.body ast))))))
+     (sm/state-maybe (fr/pure ast))
+
+     (let [outer-bindings (.args (.bindings ast))
+           inner-bindings (.args (.bindings (.v (first (.args (.body ast))))))
+           inner-body (.body (.v (first (.args (.body ast)))))]
+       (sm/state-maybe (fr/pure (ast/let-ast (apply* (fr/pure list)
+                                                     (comp outer-bindings inner-bindings))
+                                             inner-body)))))))
+
+(extend-type ast/symbol-ast
+  Rename-new-sm
+  (rename-new-sm [ast]
+    (cond
+     (= 'new-sm (.sym ast)) (comp
+                             (for [_ (sm/get-in-val (list :defined-syms 'new-sm))]
+                               (sm/state-maybe (fr/pure ast)))
+                             (sm/state-maybe (fr/pure (ast/symbol-ast 'sm/new-sm))))
+     (sm/state-maybe (fr/pure ast)))))
+
+(defn lookup-proto-fn-ast [fn-sym type-num num-args]
+  (for [qualified-name (sm/get-in-val (list :defined-protos fn-sym))
+        proto-fn (sm/get-in-val (list :protocols qualified-name :impls
+                                      type-num :fn-sym))
+        invoke-fn-sym (lookup-static-fn proto-fn num-args)
+        ast (comp (sm/get-in-val (list :static-fns proto-fn num-args :ast))
+                  (sm/get-in-val (list :core-static-fns proto-fn num-args :ast)))]
+    ast))
+
+(deftype ast-rewriter [data rewrite-fn]
+  Function
+  (invoke [ar ast]
+    (rewrite-fn ast ar)))
+
+
+;; inline-fn
+;; fn-to-let
+;; call-let all the way down
+;;   call-new-sm
+;;     fn-to-let
+;; merge-lets
+
+(defn fn-to-let [fn-ast args]
+  (cond
+   (not (instance? ast/fn-ast (.v fn-ast)))
+   (sm/state-maybe fn-ast)
+
+   (let [arg-count (count args)
+         arity (filter (.args (.arities (.v fn-ast)))
+                       (fn [arity]
+                         (= arg-count (count (.args (.args (.v arity)))))))]
+     (cond
+      (empty? arity)
+      (sm/state-maybe fn-ast)
+
+      (let [arity (.v (first arity))
+            params (.args (.args arity))
+            body (.body arity)
+            zipped (zip-lists params args)
+            binding-pairs (remove zipped (fn [pair]
+                                           (instance? ast/fn-ast (.v (second pair)))))
+            sym-ast-map (reduce zipped
+                                {}
+                                (fn [m pair]
+                                  (cond
+                                   (instance? ast/fn-ast (.v (second pair)))
+                                   (assoc m
+                                     (.sym (.v (first pair))) (second pair))
+
+                                   m)))
+            bindings (apply* (fr/pure list)
+                             (map binding-pairs
+                                  (fn [pair]
+                                    (ast/binding (first pair) (second pair)))))]
+        (cond
+         (empty? sym-ast-map)
+         (sm/state-maybe (fr/pure (ast/let-ast bindings (.body arity))))
+
+         (for [inlined-asts (sm/get-val :inlined-asts {})
+               _ (sm/update-in-val (list :inlined-asts) (fn [m] (comp m sym-ast-map)))
+               body-asts (fr/evaluate body inline-fn)
+               body-asts (traverse body-asts (fn [ast]
+                                               (for [new-ast (fr/evaluate ast calling-let)
+                                                     new-ast (fr/evaluate new-ast merge-lets)]
+                                                 new-ast)))
+               _ (sm/set-val :inlined-asts inlined-asts)]
+           (fr/pure (ast/let-ast bindings (apply* (fr/pure list) body-asts))))))))))
+
+(extend-type ast/call-ast
+  Emitter
+  (emit-c [ast]
+    (cond
+     (not (instance? ast/symbol-ast (.v (.callee ast))))
+     (emit-callsite ast)
+
+     (= 'flat-map (.sym (.v (.callee ast))))
+     (for [target (fr/evaluate (.callee ast) emit-c)
+           arg1 (fr/evaluate (first (.args (.params ast))) emit-c)
+           :let [type-num (.type-num arg1)]
+           inline-map (comp (sm/get-in-val (list :inliners type-num))
+                            (for [wrap-ast (lookup-proto-fn-ast 'wrap type-num 2)
+                                  ;; TODO: Total hack
+                                  wrap-ast (fr/evaluate wrap-ast rename-new-sm)
+                                  _ (sm/assoc-in-val (list :inlined-asts 'wrap) wrap-ast)
+                                  flat-map-ast (lookup-proto-fn-ast 'flat-map type-num 2)
+                                  ;; TODO: Total hack
+                                  flat-map-ast (fr/evaluate flat-map-ast rename-new-sm)
+                                  _ (sm/assoc-in-val (list :inlined-asts 'flat-map) flat-map-ast)
+                                  :let [inline-map {'wrap wrap-ast
+                                                    'flat-map flat-map-ast}]
+                                  _ (sm/assoc-in-val (list :inliners type-num) inline-map)]
+                              inline-map)
+                            (sm/state-maybe :no-inliner))
+           result (cond
+                   (= :no-inliner inline-map)
+                   (for [;; _ (debug :ast (fr/evaluate (.params ast) rwr/pprint))
+                         arg2 (fr/evaluate (second (.args (.params ast))) emit-c)
+                         :let [args (list (list arg1 arg2)
+                                          (comp (.init arg1) (.init arg2)))]
+                         result (call-static-fixed target args)]
+                     (c-code (.c-val result)
+                             (.init result)
+                             (.decl result)
+                             type-num))
+
+                   (for [;; _ (debug :old (fr/evaluate (second (.args (.params ast))) rwr/pprint))
+                         new-ast (fr/evaluate (second (.args (.params ast))) inline-fn)
+                         ;; _ (debug :type-num type-num :new (fr/evaluate new-ast rwr/pprint))
+
+                         arg2 (fr/evaluate new-ast emit-c)
+                         :let [args (list (list arg1 arg2)
+                                          (comp (.init arg1) (.init arg2)))]
+                         result (call-static-fixed target args)]
+                     (c-code (.c-val result)
+                             (.init result)
+                             (.decl result)
+                             type-num)))]
+       result)
+
+     (emit-callsite ast)))
+
+  CallingLet
+  (calling-let [ast]
+    (cond
+     (instance? ast/let-ast (.v (.callee ast)))
+     (let [bindings (.bindings (.v (.callee ast)))
+           ;; TODO: currently assumes .body has one element
+           body-expr (first (.args (.body (.v (.callee ast)))))]
+       ;; (print-err :calling-let (fr/evaluate (fr/pure ast) rwr/pprint))
+       (for [call-ast (cond
+                       (instance? ast/cond-ast (.v body-expr))
+                       (let [cond-ast (.v body-expr)]
+                         (for [default (fr/evaluate (fr/pure (ast/call-ast (.default cond-ast)
+                                                                           (.params ast)))
+                                                    calling-let)
+                               default (fr/evaluate default merge-lets)
+                               clauses (traverse (.clauses cond-ast)
+                                                 (fn [clause]
+                                                   (let [test (car clause)
+                                                         action (car (cdr clause))]
+                                                     (for [new-action (fr/evaluate (fr/pure
+                                                                                    (ast/call-ast action
+                                                                                                  (.params ast)))
+                                                                                   calling-let)
+                                                           new-action (fr/evaluate new-action merge-lets)]
+                                                       (list test new-action)))))]
+                           (fr/pure (ast/cond-ast clauses default))))
+
+                       (not (instance? ast/call-ast (.v body-expr)))
+                       (fr/evaluate (fr/pure (ast/call-ast body-expr (.params ast)))
+                                    calling-let)
+
+                       (not (instance? ast/symbol-ast (.v (.callee (.v body-expr)))))
+                       (sm/state-maybe (fr/pure ast))
+
+                       (not (= 'sm/new-sm (.sym (.v (.callee (.v body-expr))))))
+                       (sm/state-maybe (fr/pure ast))
+
+                       (fn-to-let (first (.args (.params (.v body-expr))))
+                                  (.args (.params ast))))]
+         (cond
+          (not (instance? fr/pure call-ast))
+          (fr/pure (ast/let-ast bindings (apply-to list call-ast)))
+
+          (not (instance? ast/let-ast (.v call-ast)))
+          (fr/pure (ast/let-ast bindings (apply-to list call-ast)))
+
+          (fr/pure (ast/let-ast (apply* (fr/pure list)
+                                        (comp (.args bindings)
+                                              (.args (.bindings (.v call-ast)))))
+                                (.body (.v call-ast)))))))
+
+     (rwr/apply-rewrite ast calling-let)))
+
+  InlineFunction
+  (inline-fn [ast]
+    (cond
+     (not (instance? ast/symbol-ast (.v (.callee ast))))
+     (rwr/apply-rewrite ast inline-fn)
+
+     (for [inlined-ast (sm/get-in-val (list :inlined-asts (.sym (.v (.callee ast)))) :not-found)
+           new-ast (cond
+                    (= :not-found inlined-ast)
+                    (rwr/apply-rewrite ast inline-fn)
+
+                    (= 'flat-map (.sym (.v (.callee ast))))
+                    (for [new-ast (fr/evaluate (second (.args (.params ast))) inline-fn)
+                          new-ast (fn-to-let inlined-ast (list (first (.args (.params ast))) new-ast))]
+                      new-ast)
+
+                    (for [args (fr/evaluate (.params ast) inline-fn)
+                          new-ast (fn-to-let inlined-ast args)]
+                      new-ast))]
+       new-ast)))
+
+  )
